@@ -171,7 +171,7 @@ def plot_recipe(best_combos, predictors, fig_dir, validation=0, figsize=(14, 12)
 
 
 
-def prepare_forest_df(results, df, sensitivity=False, advanced_cat=None):
+def prepare_forest_df(results, df, sensitivity=False, advanced_cat=None, adv_pred_width=10, other_pred_width=45):
     import re
     if not advanced_cat:
         advanced_cat = ['Lesion_volume', 'Lesion_location', 'Radiomics', 'Brain_health', 'Neural_network']
@@ -231,8 +231,8 @@ def prepare_forest_df(results, df, sensitivity=False, advanced_cat=None):
             # other_pred = other_pred.replace(', nan', '')
             # wrap text every 40 characters
             import textwrap
-            adv_pred = '\n'.join(textwrap.wrap(adv_pred, width=10))
-            other_pred = '\n'.join(textwrap.wrap(other_pred, width=45))
+            adv_pred = '\n'.join(textwrap.wrap(adv_pred, width=adv_pred_width))
+            other_pred = '\n'.join(textwrap.wrap(other_pred, width=other_pred_width))
             if row['study_id'] == 'Neuberger et al (2023)' and cat == 'Lesion_location':
                 adv_pred = 'location-specific ASPECTS'
             if row['study_id'] == 'Wong et al (2022)' and cat == 'Lesion_location':

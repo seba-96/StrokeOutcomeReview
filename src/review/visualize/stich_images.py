@@ -57,3 +57,5 @@ def stitch_figures_vertically(image_paths, output_path="output.png",
     print(f"✅ Saved stitched image to: {output_path}")
 
 
+
+

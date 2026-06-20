@@ -274,12 +274,10 @@ def run_multimodal_meta_regression(df, advanced_imaging_categories, stroke_type=
     return results
 
 
-def run_nested_meta_regression(df, advanced_imaging_categories, rho=0.7):
+def run_nested_meta_regression(df, advanced_imaging_categories):
 
     subset = df[
         -df['nested'] & (df['model.nested_comparison'] == 1) & (df['model.comparison_has_clinical_status'] == 1)].copy()
-    # drop Favilla et al (2025) as it does not report sufficient data
-    subset = subset[subset['study_id'] != 'Favilla et al (2025)'].copy()
     logger.info(f"Number of studies with nested comparison: {subset.shape[0]}")
     # compute auc difference
     subset['auc_diff_adv'] = (subset['auc'] - subset['model.without_advanced_imaging_performance_value'])
@@ -287,7 +285,7 @@ def run_nested_meta_regression(df, advanced_imaging_categories, rho=0.7):
     # merge together
     subset['auc_diff'] = subset['auc_diff_adv'].combine_first(subset['auc_diff_clin'])
 
-    # manually categorise studies which have shown inferior predictive accuracy when adding advanced neuroimaging
+    # manually categorize studies which have shown inferior predictive accuracy when adding advanced neuroimaging
     subset.loc[subset['study_id'] == 'Johnston et al (2009)', 'Lesion_volume'] = 1
     subset.loc[subset['study_id'] == 'Oliveira et al (2023)', 'Neural_network'] = 1
     # print mean delta auc for each advanced imaging category
@@ -303,9 +301,14 @@ def run_nested_meta_regression(df, advanced_imaging_categories, rho=0.7):
         'model.without_advanced_imaging_performance_variance_value'].combine_first(
         subset['model.advanced_imaging_performance_variance_metric'])
     subset['se2'] = subset.apply(derive_se, axis=1).clip(0.000000001, None)
+
+    logger.warning(f'N studies with missing rho: {subset["model.nested_comparison_r"].isna().sum()} out of {subset.shape[0]}')
+    logger.warning(f'Median rho: {subset["model.nested_comparison_r"].median()}')
+    subset['model.nested_comparison_r'] = subset['model.nested_comparison_r'].fillna(subset['model.nested_comparison_r'].median())
+
     subset['se_diff'] = np.sqrt(
         subset['se'] ** 2 + subset['se2'] ** 2 - (
-                    2 * rho * subset['se'] * subset['se2']))
+                    2 * subset['model.nested_comparison_r'] * subset['se'] * subset['se2']))
     subset['vi_diff'] = subset['se_diff'] ** 2
 
     subset = subset.drop(columns=['yi', 'vi'])
@@ -1104,3 +1107,89 @@ def evaluate_probast_risk(model):
     if any(model[col] == 'unclear' for col in ['probast.participants.risk', 'probast.outcome.risk',
                                             'probast.predictors.risk', 'probast.analysis.risk']):
         return 'unclear'
+
+
+def calculate_sampling_correlation(
+    auc0,
+    auc1,
+    p_value,
+    se0=None,
+    ci0_lower=None,
+    ci0_upper=None,
+    se1=None,
+    ci1_lower=None,
+    ci1_upper=None,
+):
+    """Calculates the sampling correlation (r) between two paired models' AUCs.
+
+    Provide either the standard errors (se0, se1) OR the 95% confidence intervals
+    (ci_lower, ci_upper) for both models.
+    """
+
+    from scipy.stats import norm
+
+    # 1. Determine Standard Error for Model 0
+    if se0 is not None:
+        SE0 = se0
+    elif ci0_lower is not None and ci0_upper is not None:
+        SE0 = (ci0_upper - ci0_lower) / (2 * 1.96)
+    else:
+        raise ValueError(
+            "You must provide either 'se0' or both 'ci0_lower' and 'ci0_upper' for Model 0."
+        )
+
+    # 2. Determine Standard Error for Model 1
+    if se1 is not None:
+        SE1 = se1
+    elif ci1_lower is not None and ci1_upper is not None:
+        SE1 = (ci1_upper - ci1_lower) / (2 * 1.96)
+    else:
+        raise ValueError(
+            "You must provide either 'se1' or both 'ci1_lower' and 'ci1_upper' for Model 1."
+        )
+
+    # 3. Calculate Delta AUC
+    delta_auc = abs(auc1 - auc0)
+
+    # 4. Convert two-tailed p-value to absolute Z-score
+    # norm.ppf calculates the percent point function (inverse of CDF)
+    z_score = abs(norm.ppf(p_value / 2))
+
+    # 5. Calculate Standard Error of the Difference (SE_delta)
+    if z_score == 0:
+        raise ValueError("Z-score cannot be zero. Check your p-value.")
+    SE_delta = delta_auc / z_score
+
+    # 6. Solve for the sampling correlation coefficient (r) using the variance formula
+    # SE_delta^2 = SE0^2 + SE1^2 - 2 * r * SE0 * SE1
+    numerator = (SE0**2) + (SE1**2) - (SE_delta**2)
+    denominator = 2 * SE0 * SE1
+    r = numerator / denominator
+
+    # 7. Print diagnostic results
+    print("--- Statistical Breakdown ---")
+    print(f"Model 0 SE:                {SE0:.5f}")
+    print(f"Model 1 SE:                {SE1:.5f}")
+    print(f"Delta AUC:                 {delta_auc:.5f}")
+    print(f"Z-score (from p={p_value}):  {z_score:.4f}")
+    print(f"Delta AUC SE:              {SE_delta:.5f}")
+    print(f"Calculated Sampling r:     {r:.4f}")
+
+    # Validation Warning Check
+    if r > 1.0 or r < -1.0:
+        print(
+            "\n⚠️ WARNING: The calculated correlation coefficient is mathematically impossible (outside [-1, 1])."
+        )
+        print(
+            "This strongly suggests that the paper's individual CIs/SEs are inflated or asymmetric,"
+        )
+        print(
+            "likely due to bootstrapping or cross-validation resampling noise."
+        )
+        print("Do NOT include this specific 'r' value in your imputation pool.")
+    else:
+        print(
+            "\n✅ SUCCESS: This 'r' is mathematically valid and safe to use in your imputation pool."
+        )
+
+    return r

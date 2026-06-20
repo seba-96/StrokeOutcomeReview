@@ -20,6 +20,7 @@ from src.review.visualize.stich_images import stitch_figures_vertically
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+# change the following root path according to where the repo is located
 root_dir = '/Users/sebastiano/Desktop/PostDoc/StrokeOutcomeReview/'
 data_dir = os.path.join(root_dir, 'data')
 fig_dir = os.path.join(root_dir, 'report', 'figures')
@@ -441,7 +442,7 @@ logger.warning(
     f"Covariate:\n{results[results['name'].isin(['external_validation', 'post_treatment_models'])][['stroke_type', 'name', 'category', 'delta', 'p-value']].round(3)}")
 # drop post_treatment_models
 results = results[~results['name'].isin(['post_treatment_models', 'external_validation'])].reset_index(drop=True)
-results = prepare_forest_df(results, df, sensitivity=False)
+results = prepare_forest_df(results, df, sensitivity=False, adv_pred_width=20)
 # rename Validation into val
 results = results.rename(columns={
     'Validated': 'Val.',
@@ -774,7 +775,7 @@ for cat in add['category'].unique():
         'row_type': 'group_header',
     })
     subset = add[add['category'] == cat].sort_values(by='auc_delta', ascending=True)
-    for _, row in subset[subset['studies'] != 'Favilla et al (2025)'].iterrows():
+    for _, row in subset.iterrows():
         auc_delta = row['auc_delta']
         var_delta = row['var_delta']
         se_delta = np.sqrt(var_delta)
@@ -785,7 +786,7 @@ for cat in add['category'].unique():
         row_cat = np.array(row['predictors.category'].split(', '))
         row_pred = np.array(row['predictors.scale'].split(', '))
         adv_pred = ', '.join(np.unique(row_pred[row_cat == cat.replace('_', ' ').lower()]).tolist())
-        adv_pred = adv_pred.replace('infarct growth, ', '').replace('white matter hyperintensities', 'WMH')
+        adv_pred = adv_pred.replace('white matter hyperintensities', 'WMH')
 
         if row['studies'] == 'Johnston et al (2009)':
             adv_pred = 'infarct volume'
