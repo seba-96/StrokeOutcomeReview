@@ -32,6 +32,11 @@ if clear_fig_dir and os.path.exists(fig_dir):
         os.remove(os.path.join(fig_dir, f))
 
 df = pd.read_excel(os.path.join(data_dir, 'final', 'database_18_06_26.xlsx'))
+# these refs must have the letter suffix in the reference section of the paper
+ref_check = df.loc[df['first_author_year'].str.endswith('a)'), ['first_author_year', 'Title']].drop_duplicates()
+ref_check1 = df.loc[df['first_author_year'].str.endswith('b)'), ['first_author_year', 'Title']].drop_duplicates()
+ref_check2 = df.loc[df['first_author_year'].str.endswith('c)'), ['first_author_year', 'Title']].drop_duplicates()
+
 pred_categories = [
     'Anamnesis',
     'Clinical status',
@@ -86,13 +91,13 @@ logger.warning(df[-df['nested']]['probast.analysis.risk'].value_counts())
 logger.warning(df[-df['nested']]['probast.participants.risk'].value_counts())
 logger.warning(df[-df['nested']]['probast.outcome.risk'].value_counts())
 logger.warning(df[-df['nested']]['probast.predictors.risk'].value_counts())
-check = df.loc[
-    -df['nested'] & (df['overall_risk'] == 'low'), ['study_id', 'Title', 'model_id', 'n_total', 'model.validation',
-                                                    'probast.participants.risk', 'probast.participants.rationale',
-                                                    'probast.outcome.risk', 'probast.outcome.rationale',
-                                                    'probast.predictors.risk', 'probast.predictors.rationale',
-                                                    'probast.analysis.risk', 'probast.analysis.rationale',
-                                                    'predictors.scale']]
+probast_table = df.loc[-df['nested'], ['study_id', 'probast.participants.risk',
+                                                    'probast.outcome.risk',
+                                                    'probast.predictors.risk',
+                                                    'probast.analysis.risk',
+                                                    'overall_risk']]
+# check = probast_table[probast_table['study_id'].duplicated(keep=False)].sort_values(by='study_id', ascending=False)
+probast_table.to_excel(os.path.join(root_dir, 'report', 'tables', 'probast.xlsx'), index=False)
 
 risk_order = ['low', 'unclear', 'high']
 risk_colors = {
@@ -521,6 +526,7 @@ for cat in ['Lesion_volume', 'Lesion_location', 'Radiomics', 'Brain_health', 'Ne
 
 stitch_figures_vertically([os.path.join(fig_dir, f'forest_{cat}.png') for cat in ['Lesion_volume', 'Lesion_location', 'Radiomics', 'Brain_health', 'Neural_network']],
                           output_path=os.path.join(fig_dir, f'forest_stiched.png'),
+                          panels_output_dir=fig_dir,
                           label_size=100)
 
 # represent only Baseline models
@@ -685,6 +691,12 @@ for cat in ['Lesion_volume', 'Lesion_location', 'Radiomics', 'Brain_health', 'Ne
     plt.savefig(os.path.join(fig_dir, f'forest_{cat}_subset.png'), dpi=300)
     plt.show()
 
+# stich
+stitch_figures_vertically([os.path.join(fig_dir, f'forest_{cat}_subset.png') for cat in ['Lesion_volume', 'Lesion_location', 'Radiomics', 'Brain_health', 'Neural_network']],
+                          output_path=os.path.join(fig_dir, f'forest_stiched_subset.png'),
+                          panels_output_dir=fig_dir,
+                          panel_prefix='forest_subset_panel_',
+                          label_size=100)
 # sensitivity analysis separately on severe, moderate, mild ischemic stroke
 results = []
 for severity in ['mild', 'moderate', 'severe']:
