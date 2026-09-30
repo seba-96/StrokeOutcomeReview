@@ -1,3 +1,5 @@
+import textwrap
+
 import seaborn as sns
 import numpy as np
 import pandas as pd
@@ -171,7 +173,7 @@ def plot_recipe(best_combos, predictors, fig_dir, validation=0, figsize=(14, 12)
 
 
 
-def prepare_forest_df(results, df, sensitivity=False, advanced_cat=None, adv_pred_width=10, other_pred_width=45):
+def prepare_forest_df(results, df, advanced_cat=None, adv_pred_width=10, other_pred_width=45):
     import re
     if not advanced_cat:
         advanced_cat = ['Lesion_volume', 'Lesion_location', 'Radiomics', 'Brain_health', 'Neural_network']
@@ -179,29 +181,16 @@ def prepare_forest_df(results, df, sensitivity=False, advanced_cat=None, adv_pre
     add_single = []
 
     for cat in advanced_cat:
-        if sensitivity:
-            if cat == 'Baseline':
-                subset = df[-df['nested']
-                            & (df['Clinical_status'] == 1)
-                            & (df[advanced_cat].sum(axis=1) == 0)
-                            & (df['sample.stroke_type'] == 'ischemic')
-                            & (df['three_months_outcome'] == 1)
-                            & (df['outcome.worse_class_cutoff'] == 3)]
-            else:
-                subset = df[-df['nested']
-                            & (df[cat] == 1)
-                            & (df['sample.stroke_type'] == 'ischemic')
-                            & (df['three_months_outcome'] == 1)
-                            & (df['outcome.worse_class_cutoff'] == 3)]
+        if cat == 'Baseline':
+            subset = df[-df['nested']
+                        & df['study_id'].apply(
+                lambda x: x in results.loc[results['category'] == 'Clinical_status', 'studies'].iloc[0])
+                        ]
         else:
-            if cat == 'Baseline':
-                subset = df[-df['nested']
-                            & (df['Clinical_status'] == 1)
-                            & (df[advanced_cat].sum(axis=1) == 0)
-                            & (df['sample.stroke_type'] == 'ischemic')]
-            else:
-                subset = df[-df['nested'] & (df[cat] == 1) & (df['sample.stroke_type'] == 'ischemic')]
-
+            subset = df[-df['nested']
+                        & df['study_id'].apply(
+                lambda x: x in results.loc[results['category'] == cat, 'studies'].iloc[0])
+                        ]
         # sort by auc
         subset = subset.sort_values(by='auc', ascending=True).reset_index(drop=True)
 
@@ -217,6 +206,9 @@ def prepare_forest_df(results, df, sensitivity=False, advanced_cat=None, adv_pre
             'Severity': '',
         })
         for _, row in subset.iterrows():
+            if row['post_treatment_imaging'] == 1:
+                print('Post-treatment imaging model found in category', cat, 'for study', row['study_id'])
+
             auc = row['auc']
             se = row['se']
             ci_lower = auc - 1.96 * se
@@ -250,6 +242,15 @@ def prepare_forest_df(results, df, sensitivity=False, advanced_cat=None, adv_pre
                 abbreviations = '-'.join(re.findall(r'\b[A-Z]{2,}|lesion\b', adv_pred))
                 if adv_pred != 'infarct density':
                     adv_pred = abbreviations + ' radiomics' if cat == 'Radiomics' else abbreviations + ' raw image'
+
+            post_treatment_models = row['post_treatment_models']
+            if np.isnan(post_treatment_models):
+                post_treatment_models = ''
+            elif post_treatment_models == 1:
+                post_treatment_models = 'yes'
+            else:
+                post_treatment_models = 'no'
+
             add_single.append({
                 'Study': row['study_id'],
                 'name': cat,
@@ -259,7 +260,7 @@ def prepare_forest_df(results, df, sensitivity=False, advanced_cat=None, adv_pre
                 'ci_0.975': ci_higher,
                 'Severity': row['severity'],
                 'Validated': 'yes' if row['external_validation'] == 1 else 'no',
-                'Post-treatment': 'yes' if row['post_treatment_models'] == 1 else 'no',
+                'Post-treatment': post_treatment_models,
                 'row_type': 'study',
                 'Imaging feature': adv_pred,
                 'Other features': other_pred,
@@ -300,7 +301,6 @@ def prepare_forest_df(results, df, sensitivity=False, advanced_cat=None, adv_pre
     results = pd.concat(
         [results[results['category'] == 'Clinical_status'].reset_index(drop=True), add_single]).reset_index(
         drop=True)
-    del add_single
     results['row_type_'] = results['row_type']
     results.loc[results['Study'] == 'Baseline', 'row_type_'] = 'baseline'
     # replace nan with empty string in Imaging feature, Validated, Post-treatment, Severity
@@ -310,10 +310,94 @@ def prepare_forest_df(results, df, sensitivity=False, advanced_cat=None, adv_pre
     results['Post-treatment'] = results['Post-treatment'].fillna('')
     results['Severity'] = results['Severity'].fillna('')
 
+    results = results.rename(columns={
+        'Validated': 'Val.',
+        'Post-treatment': 'Post',
+        'Imaging feature': 'Imaging feat.',
+    })
+
     return results
 
 
+def prepare_forest_df_nested(add, results, df):
 
+    add = add.explode(['Key', 'studies', 'auc_delta', 'var_delta', ]).reset_index(drop=True)
+
+    add_single = []
+    for cat in add['category'].unique():
+        add_single.append({
+            'Study': cat.replace('_', ' '),
+            'row_type': 'group_header',
+        })
+        subset = add[add['category'] == cat].sort_values(by='auc_delta', ascending=True)
+        for _, row in subset.iterrows():
+            auc_delta = row['auc_delta']
+            var_delta = row['var_delta']
+            se_delta = np.sqrt(var_delta)
+            ci_lower = auc_delta - 1.96 * se_delta
+            ci_higher = auc_delta + 1.96 * se_delta
+            row['predictors.category'] = \
+            df.loc[-df['nested'] & (df['Key'] == row['Key']), 'predictors.category'].values[0]
+            row['predictors.scale'] = df.loc[-df['nested'] & (df['Key'] == row['Key']), 'predictors.scale'].values[0]
+            row_cat = np.array(row['predictors.category'].split(', '))
+            row_pred = np.array(row['predictors.scale'].split(', '))
+            adv_pred = ', '.join(np.unique(row_pred[row_cat == cat.replace('_', ' ').lower()]).tolist())
+            adv_pred = adv_pred.replace('white matter hyperintensities', 'WMH')
+
+            if row['studies'] == 'Johnston et al (2009)':
+                adv_pred = 'infarct volume'
+            if row['studies'] == 'Oliveira et al (2023)':
+                adv_pred = 'CTA raw image'
+            other_pred = ', '.join(np.unique(row_pred[row_cat != cat.replace('_', ' ').lower()]).tolist())
+            adv_pred = '\n'.join(textwrap.wrap(adv_pred, width=30))
+            other_pred = '\n'.join(textwrap.wrap(other_pred, width=45))
+            val = 'yes' if df.loc[df['Key'] == row['Key'], 'external_validation'].values[0] == 1 else 'no'
+            # get severity
+            severity = df.loc[df['Key'] == row['Key'], 'severity'].values[0]
+            # if its missing put empty string
+            if pd.isna(severity):
+                severity = ''
+
+            if df.loc[df['Key'] == row['Key'], 'post_treatment_models'].values[0] == 1:
+                post = 'yes'
+            elif df.loc[df['Key'] == row['Key'], 'post_treatment_models'].values[0] == 0:
+                post = 'no'
+            else:
+                post = ''
+            add_single.append({
+                'Study': row['studies'],
+                'name': cat,
+                'category': cat,
+                'estimate': auc_delta,
+                'ci_0.025': ci_lower,
+                'ci_0.975': ci_higher,
+                'Val.': val,
+                'Post': post,
+                'Severity': severity,
+                'Added imaging': adv_pred,
+                'Nested model': other_pred,
+                'row_type': 'study',
+            })
+        # add group summary
+        pooled = results.loc[results['category'] == cat, :].iloc[0].to_dict()
+        mdl_summary = f'RE model - pooled ΔAUC p={pooled["p-value"]:.3f}'
+        mdl_het = f'I² {pooled["I2"]:.1f}%, τ² {pooled["tau2"]:.3f} p={pooled["p_het"]:.3f}'
+        add_single.append({
+            'Study': mdl_summary,
+            'row_type': 'group_summary',
+            **pooled
+        })
+        pooled['estimate'] = np.nan
+        pooled['ci_0.025'] = np.nan
+        pooled['ci_975'] = np.nan
+        add_single.append({
+            'Study': mdl_het,
+            'row_type': 'group_summary',
+            **pooled
+        })
+    results = pd.DataFrame(add_single)
+
+    return results
 
 def forest_plot_from_df(
     df: pd.DataFrame,
@@ -321,6 +405,7 @@ def forest_plot_from_df(
     ci_low_col: str,
     ci_high_col: str,
     label_col: str = "Study",
+    rename_labels: dict | None = None,
     row_type_col: str = "row_type",
     extra_cols=None,
     weight_col: str | None = None,
@@ -377,6 +462,11 @@ def forest_plot_from_df(
     bold_labels = set(bold_labels or [])
     indent_labels = set(indent_labels or [])
     color_map = color_map or {}
+
+    if not rename_labels:
+        rename_labels = {'Neural network': 'Whole-brain images', 'Radiomics': 'Lesion radiomics'}
+
+    df[label_col] = df[label_col].replace(rename_labels)
 
     # ---------- Identify where to add gaps ----------
     should_add_gap = []

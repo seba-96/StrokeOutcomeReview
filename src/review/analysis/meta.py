@@ -226,19 +226,35 @@ def meta_reg(df, predictors, yi_col='yi', vi_col='vi', covariates=None, alpha=0.
 
 
 
-def run_multimodal_meta_regression(df, advanced_imaging_categories, stroke_type='ischemic', covariates='external_validation'):
+def run_multimodal_meta_regression(df, advanced_imaging_categories, stroke_type='ischemic',
+                                   covariates='external_validation', impute_covariates=True, mri=None, post_treatment_imaging_only=False):
 
     results = []
     for category in advanced_imaging_categories:
 
         subset_clinical = df[(df['sample.stroke_type'] == stroke_type) & (df['Clinical_status'] == 1) & (-df['nested'])].copy()
         subset_clinical = subset_clinical[subset_clinical[advanced_imaging_categories].sum(axis=1) == 0]
+        logger.warning(f"Number of models in the clinical subset: {subset_clinical.shape[0]}")
 
         subset_advanced = df[(df['sample.stroke_type'] == stroke_type) & (df[category] == 1) & (-df['nested'])].copy()
-
+        if post_treatment_imaging_only:
+            subset_advanced = subset_advanced[subset_advanced['post_treatment_imaging'] == 1]
+        if mri is not None:
+            if mri:
+                subset_advanced = subset_advanced[subset_advanced['MRI'] == 1]
+            else:
+                subset_advanced = subset_advanced[subset_advanced['MRI'].isin([0, -1, np.nan])]
 
         # collapse together
         subset = pd.concat([subset_clinical, subset_advanced]).reset_index(drop=True)
+
+        if impute_covariates:
+            # impute missing value with the mode
+            for cov in covariates:
+                if subset[cov].isna().sum() > 0:
+                    mode_value = subset[cov].mode().iloc[0]
+                    logger.warning(f"Imputing missing values for {cov} with mode: {mode_value}")
+                    subset[cov] = subset[cov].fillna(mode_value)
 
         if subset_advanced.shape[0] < 2:
             logger.warning(f"Skipping category {category} due to insufficient models ({subset_advanced.shape[0]} models)")
@@ -274,7 +290,7 @@ def run_multimodal_meta_regression(df, advanced_imaging_categories, stroke_type=
     return results
 
 
-def run_nested_meta_regression(df, advanced_imaging_categories):
+def run_nested_meta_regression(df, advanced_imaging_categories, drop_missing_rho=False):
 
     subset = df[
         -df['nested'] & (df['model.nested_comparison'] == 1) & (df['model.comparison_has_clinical_status'] == 1)].copy()
@@ -303,6 +319,14 @@ def run_nested_meta_regression(df, advanced_imaging_categories):
     subset['se2'] = subset.apply(derive_se, axis=1).clip(0.000000001, None)
 
     logger.warning(f'N studies with missing rho: {subset["model.nested_comparison_r"].isna().sum()} out of {subset.shape[0]}')
+    # print out the studies with missing rho
+    missing_rho_studies = subset[subset["model.nested_comparison_r"].isna()]["study_id"].tolist()
+    logger.warning(f'Studies with missing rho: {missing_rho_studies}')
+    if drop_missing_rho:
+        subset = subset.dropna(subset="model.nested_comparison_r")
+    # print the studies with rho
+    logger.warning(f'Studies with rho: {subset[subset["model.nested_comparison_r"].notna()]["study_id"].tolist()}')
+
     logger.warning(f'Median rho: {subset["model.nested_comparison_r"].median()}')
     subset['model.nested_comparison_r'] = subset['model.nested_comparison_r'].fillna(subset['model.nested_comparison_r'].median())
 
@@ -351,7 +375,13 @@ def run_nested_meta_regression(df, advanced_imaging_categories):
                 })
             else:
                 logger.warning(
-                    f"Not enough models for category {category} (N={subset.shape[0]})")
+                    f"Not enough models for category {category} (N={cat_subset.shape[0]})")
+                # print study_id and related change observed
+                for _, row in cat_subset.iterrows():
+                    logger.warning(
+                        f"Study {row['study_id']}: delta AUC={row['yi']:.3f}, var={row['vi']:.6f}")
+    if len(all_results) == 0:
+        raise Exception('No studies found for any category with at least 2 models.')
 
     all_results = pd.concat(all_results)
     studies = pd.DataFrame(studies)

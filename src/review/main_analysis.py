@@ -2,8 +2,6 @@ import os
 import pandas as pd, numpy as np, matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import pearsonr, spearmanr, ttest_ind
-from ast import literal_eval
-import plotly.express as px
 import textwrap
 import re
 import logging
@@ -11,9 +9,10 @@ import logging
 
 from src.review.analysis.meta import derive_se, \
     run_multimodal_meta_regression, \
-    country_to_iso3, run_nested_meta_regression, learn_surrogate_and_rank, evaluate_probast_risk
+    run_nested_meta_regression, learn_surrogate_and_rank, evaluate_probast_risk
 from src.review.preprocessing.basic import count_predictors, from_long_to_wide
-from src.review.visualize.plot import plot_recipe, forest_plot_from_df, prepare_forest_df
+from src.review.visualize.plot import plot_recipe, forest_plot_from_df, prepare_forest_df, prepare_forest_df_nested
+from src.review.visualize.plot_control_analyses import plot_control_analyses, save_figure
 from src.review.visualize.stich_images import stitch_figures_vertically
 
 
@@ -31,7 +30,7 @@ if clear_fig_dir and os.path.exists(fig_dir):
     for f in os.listdir(fig_dir):
         os.remove(os.path.join(fig_dir, f))
 
-df = pd.read_excel(os.path.join(data_dir, 'final', 'database_18_06_26.xlsx'))
+df = pd.read_excel(os.path.join(data_dir, 'final', 'database_30_09_26.xlsx'))
 # these refs must have the letter suffix in the reference section of the paper
 ref_check = df.loc[df['first_author_year'].str.endswith('a)'), ['first_author_year', 'Title']].drop_duplicates()
 ref_check1 = df.loc[df['first_author_year'].str.endswith('b)'), ['first_author_year', 'Title']].drop_duplicates()
@@ -70,6 +69,8 @@ df = from_long_to_wide(df)
 logger.warning(f"Dataframe shape after converting to wide format: {df.shape}")
 logger.warning(f"Number of non-nested models: {df[-df['nested']].shape[0]}")
 
+df['CT'] = df['predictors.imaging.sequence'].str.startswith('ct-').astype(float)
+df['MRI'] = df['predictors.imaging.sequence'].str.startswith('mri-').astype(float)
 df['external_validation'] = (df['model.validation'] == 'external validation').astype(int)
 logger.info(f'Sample stroke type distribution:\n{df.loc[-df['nested'], "sample.stroke_type"].value_counts()}')
 
@@ -146,7 +147,7 @@ del dom, pivot, ax
 df['EVT'] = df['charms.hyper_acute_treatments'].str.contains('mechanical_thrombectomy_EVT', na=False)
 df['IV_alteplase'] = df['charms.hyper_acute_treatments'].str.contains('IV_alteplase', na=False)
 df['only_IV_alteplase'] = df['charms.hyper_acute_treatments'] == 'IV_alteplase'
-df['post_treatment_models'] = (df['charms.predictors_acquisition_timing'] != 'pre_treatment').astype(int)
+df.loc[df['predictors.scale'].str.contains('reperfusion therapies|neurological deterioration|NIHSS post treatment', case=False), 'post_treatment_models'] = 1
 
 # count number of post-treatment models
 logger.warning(
@@ -162,6 +163,8 @@ for category in pred_categories_col:
 
 # impute n_pos if var_value is missing
 missing_npos_varvalue = df.loc[-df['nested'] & df['var_value'].isna() & df['n_pos'].isna()]
+df['missing_varvalue'] = 0
+df.loc[missing_npos_varvalue.index, 'missing_varvalue'] = 1
 logger.warning(f"Number of models with missing n_pos and var_value: {missing_npos_varvalue.shape[0]}")
 
 df.loc[df['var_value'].isna() & df['n_pos'].isna(), 'n_pos'] = df.loc[df['var_value'].isna() & df[
@@ -189,9 +192,7 @@ df['cutoff'] = np.select([df['outcome.worse_class_cutoff'] == 3,
 # impute sample.nih_stroke_scale.value with median
 median_nihss = df.loc[
     -df['nested'] & (df['sample.stroke_type'] == 'ischemic'), 'sample.nih_stroke_scale.value'].median()
-df.loc[df['sample.nih_stroke_scale.value'].isna() & (
-        df['sample.stroke_type'] == 'ischemic'), 'sample.nih_stroke_scale.value'] = median_nihss
-logger.warning(f"Imputed median NIHSS {median_nihss}")
+logger.warning(f"Median NIHSS {median_nihss}")
 # separate into mild, moderate, severe
 df['severity'] = pd.cut(df['sample.nih_stroke_scale.value'], bins=[-1, 4, 15, 42],
                         labels=['mild', 'moderate', 'severe'])
@@ -413,30 +414,191 @@ for i, ax in enumerate(plt.gcf().axes):
 plt.savefig(os.path.join(fig_dir, f'predictors_per_model_category.png'))
 plt.show()
 
+print(f"Mean sample size (advanced imaging models, ischemic stroke): {df.loc[-df['nested'] & (df[advanced_imaging_categories].sum(axis=1) >= 1), 'n_total'].mean():.1f}")
+print(f"Mean sample size (non-advanced imaging models, ischemic stroke): {df.loc[-df['nested'] & (df[advanced_imaging_categories].sum(axis=1) == 0), 'n_total'].mean():.1f}")
+print(f"Mean sample size (all models, ischemic stroke): {df.loc[-df['nested'], 'n_total'].mean():.1f}")
 
-# print mean auc pre- and post-treatment models
-mean_auc_pre = df.loc[
-    -df['nested'] & (df['sample.stroke_type'] == 'ischemic') & (df['post_treatment_models'] == 0), 'auc'].mean()
-mean_auc_post = df.loc[
-    -df['nested'] & (df['sample.stroke_type'] == 'ischemic') & (df['post_treatment_models'] == 1), 'auc'].mean()
-logger.warning(f"Mean AUC (pre-treatment models, ischemic stroke): {mean_auc_pre:.2f}")
-logger.warning(f"Mean AUC (post-treatment models, ischemic stroke): {mean_auc_post:.2f}")
+# %%
+# ------------------------------ Within study analyses (nested models) ------------------------------
+results, add = run_nested_meta_regression(df,
+                                          advanced_imaging_categories=advanced_imaging_categories)
 
-# mean n_total of neuroimaging models vs non-neuroimaging models
-mean_n_neuro = df.loc[
-    -df['nested'] & (df['sample.stroke_type'] == 'ischemic') & (df['Neural_network'] == 1) | (df['Radiomics'] == 1) | (
-            df['Lesion_volume'] == 1) | (df['Lesion_location'] == 1) | (df['Brain_health'] == 1), 'n_total'].mean()
-mean_n_non_neuro = df.loc[
-    -df['nested'] & (df['sample.stroke_type'] == 'ischemic') & (df['Neural_network'] == 0) & (df['Radiomics'] == 0) & (
-            df['Lesion_volume'] == 0) & (df['Lesion_location'] == 0) & (df['Brain_health'] == 0), 'n_total'].mean()
-logger.warning(f"Mean sample size (neuroimaging models, ischemic stroke): {mean_n_neuro:.1f}")
-logger.warning(f"Mean sample size (non-neuroimaging models, ischemic stroke): {mean_n_non_neuro:.1f}")
+results = prepare_forest_df_nested(add, results, df)
 
-del mean_n_neuro, mean_n_non_neuro
+fig, axes = forest_plot_from_df(
+    results,
+    effect_col="estimate",
+    ci_low_col="ci_0.025",
+    ci_high_col="ci_0.975",
+    label_col="Study",
+    x_axis_label='ΔAUC',
+    numeric_col_header="ΔAUC (95% CI)",
+    row_type_col="row_type",
+    extra_cols=['Val.', 'Post', 'Severity', 'Nested model','Added imaging'],
+    panel_width_ratios=[3.8, 1.0, 0.6],
+    text_col_widths=[0.3, 0.1, 0.1, 0.15, 0.6, 0.42],
+    show_vertical_lines=True,
+    show_study_separators=True,
+    fontsize=12,
+    header_fontsize=13,
+    header_top_pad=1,
+    text_pad=0.02,
+    figsize=(16, 16),
+    row_height=0.85,  # controls vertical spacing
+    group_gap=0.9,  # extra gap after each subgroup pooled row
+    bold_group_summary=False,
+    xlim=None,
+    xticks=[-0.05, 0, 0.05, 0.1],
+    vertical_line_color={
+        0: 'crimson'
+    },
+    color_by_col='row_type',
+    color_map={
+        'group_summary': 'cornflowerblue',
+        'study': 'mediumseagreen',
+    },
+)
+plt.savefig(os.path.join(fig_dir, f'forest_nested.png'), dpi=300)
+plt.show()
 
-# count females
-logger.warning(df.loc[-df['nested'], 'sample.females.value'].mean())
 
+# %%
+# ------------------------------ Within study analyses (nested models) ------------------------------
+results, add = run_nested_meta_regression(df[(df['post_treatment_models'] == 0)],
+                                          advanced_imaging_categories=advanced_imaging_categories)
+
+
+# %%
+# ------------------------------ Within study analyses (nested models) ------------------------------
+results, add = run_nested_meta_regression(df[(df['post_treatment_models'] == 1) & (df['post_treatment_imaging'] == 1)],
+                                          advanced_imaging_categories=advanced_imaging_categories)
+results = prepare_forest_df_nested(add, results, df)
+results.to_csv(os.path.join(root_dir, 'report', 'tables', 'forest_post_treatment_nested.csv'), index=False)
+
+fig, axes = forest_plot_from_df(
+    results,
+    effect_col="estimate",
+    ci_low_col="ci_0.025",
+    ci_high_col="ci_0.975",
+    label_col="Study",
+    x_axis_label='ΔAUC',
+    numeric_col_header="ΔAUC (95% CI)",
+    row_type_col="row_type",
+    extra_cols=['Val.', 'Post', 'Severity', 'Nested model','Added imaging'],
+    panel_width_ratios=[3.6, 1.0, 0.6],
+    text_col_widths=[0.26, 0.1, 0.1, 0.15, 0.5, 0.35],
+    show_vertical_lines=True,
+    show_study_separators=True,
+    fontsize=12,
+    header_fontsize=13,
+    header_top_pad=1,
+    text_pad=0.02,
+    figsize=(16, 6.5),
+    row_height=0.85,  # controls vertical spacing
+    group_gap=0.9,  # extra gap after each subgroup pooled row
+    bold_group_summary=False,
+    xlim=None,
+    xticks=[-0.05, 0, 0.05, 0.1],
+    vertical_line_color={
+        0: 'crimson'
+    },
+    color_by_col='row_type',
+    color_map={
+        'group_summary': 'cornflowerblue',
+        'study': 'mediumseagreen',
+    },
+)
+plt.savefig(os.path.join(fig_dir, f'forest_post_treatment_nested.png'), dpi=300)
+plt.show()
+
+# %%
+results, add = run_nested_meta_regression(df[(df['severity'] == 'moderate')],
+                                          advanced_imaging_categories=advanced_imaging_categories)
+
+
+results = prepare_forest_df_nested(add, results, df)
+results.to_csv(os.path.join(root_dir, 'report', 'tables', 'forest_severity_nested.csv'), index=False)
+
+fig, axes = forest_plot_from_df(
+    results,
+    effect_col="estimate",
+    ci_low_col="ci_0.025",
+    ci_high_col="ci_0.975",
+    label_col="Study",
+    x_axis_label='ΔAUC',
+    numeric_col_header="ΔAUC (95% CI)",
+    row_type_col="row_type",
+    extra_cols=['Val.', 'Post', 'Severity', 'Nested model','Added imaging'],
+    panel_width_ratios=[3.6, 0.8, 0.4],
+    text_col_widths=[0.25, 0.1, 0.1, 0.15, 0.53, 0.37],
+    show_vertical_lines=True,
+    show_study_separators=True,
+    fontsize=12,
+    header_fontsize=13,
+    header_top_pad=1,
+    text_pad=0.02,
+    figsize=(16, 12),
+    row_height=0.85,  # controls vertical spacing
+    group_gap=0.9,  # extra gap after each subgroup pooled row
+    bold_group_summary=False,
+    xlim=None,
+    xticks=[-0.05, 0, 0.05, 0.1],
+    vertical_line_color={
+        0: 'crimson'
+    },
+    color_by_col='row_type',
+    color_map={
+        'group_summary': 'cornflowerblue',
+        'study': 'mediumseagreen',
+    },
+)
+plt.savefig(os.path.join(fig_dir, f'forest_severity_moderate_nested.png'), dpi=300)
+plt.show()
+
+# %%
+results, add = run_nested_meta_regression(df[(df['three_months_outcome'] == 1) & (df['outcome.worse_class_cutoff'] == 3)],
+                                          advanced_imaging_categories=advanced_imaging_categories,
+                                          drop_missing_rho=True)
+
+results = prepare_forest_df_nested(add, results, df)
+results.to_csv(os.path.join(root_dir, 'report', 'tables', 'forest_restricted_nested.csv'), index=False)
+
+fig, axes = forest_plot_from_df(
+    results,
+    effect_col="estimate",
+    ci_low_col="ci_0.025",
+    ci_high_col="ci_0.975",
+    label_col="Study",
+    x_axis_label='ΔAUC',
+    numeric_col_header="ΔAUC (95% CI)",
+    row_type_col="row_type",
+    extra_cols=['Val.', 'Post', 'Severity', 'Nested model', 'Added imaging'],
+    panel_width_ratios=[3.5, 1.0, 0.6],
+    text_col_widths=[0.26, 0.1, 0.1, 0.15, 0.56, 0.39],
+    show_vertical_lines=True,
+    show_study_separators=True,
+    fontsize=12,
+    header_fontsize=13,
+    header_top_pad=1,
+    text_pad=0.02,
+    figsize=(16, 8),
+    row_height=0.85,  # controls vertical spacing
+    group_gap=0.9,  # extra gap after each subgroup pooled row
+    bold_group_summary=False,
+    xlim=None,
+    xticks=[-0.05, 0, 0.05, 0.1],
+    vertical_line_color={
+        0: 'crimson'
+    },
+    color_by_col='row_type',
+    color_map={
+        'group_summary': 'cornflowerblue',
+        'study': 'mediumseagreen',
+    },
+)
+plt.savefig(os.path.join(fig_dir, f'forest_sensitivity_nested.png'), dpi=300)
+plt.show()
+# %%
 
 # -----------------------------------Multimodal-between-study analysis: category -----------------------------------
 results = run_multimodal_meta_regression(df,
@@ -445,15 +607,10 @@ results = run_multimodal_meta_regression(df,
                                          covariates=['external_validation', 'post_treatment_models'],)
 logger.warning(
     f"Covariate:\n{results[results['name'].isin(['external_validation', 'post_treatment_models'])][['stroke_type', 'name', 'category', 'delta', 'p-value']].round(3)}")
-# drop post_treatment_models
 results = results[~results['name'].isin(['post_treatment_models', 'external_validation'])].reset_index(drop=True)
-results = prepare_forest_df(results, df, sensitivity=False, adv_pred_width=20)
-# rename Validation into val
-results = results.rename(columns={
-    'Validated': 'Val.',
-    'Post-treatment': 'Post',
-    'Imaging feature': 'Imaging feat.',
-})
+
+results = prepare_forest_df(results, df, adv_pred_width=20)
+
 plot_params = {
     'Lesion_volume': {
         'xlim': (0.5, 1),
@@ -525,7 +682,7 @@ for cat in ['Lesion_volume', 'Lesion_location', 'Radiomics', 'Brain_health', 'Ne
     plt.show()
 
 stitch_figures_vertically([os.path.join(fig_dir, f'forest_{cat}.png') for cat in ['Lesion_volume', 'Lesion_location', 'Radiomics', 'Brain_health', 'Neural_network']],
-                          output_path=os.path.join(fig_dir, f'forest_stiched.png'),
+                          output_path=os.path.join(fig_dir, f'forest_across_study.png'),
                           panels_output_dir=fig_dir,
                           label_size=100)
 
@@ -606,28 +763,193 @@ for subset in [0, 1]:
     plt.savefig(os.path.join(fig_dir, f'forest_baseline_subset{subset}.png'), dpi=300)
     plt.show()
 
+# %%
+# Primary control analysis timing stratified
+results = run_multimodal_meta_regression(df[(df['post_treatment_models'] == 0)],
+                                         advanced_imaging_categories=advanced_imaging_categories,
+                                         covariates=['external_validation'],
+                                         post_treatment_imaging_only=False,
+                                         mri=None)
 
+print(
+    f"Covariate:\n{results[results['name'].isin(['external_validation', 'post_treatment_models'])][['stroke_type', 'name', 'category', 'delta', 'p-value']].round(3)}")
+results = results[~results['name'].isin(['post_treatment_models', 'external_validation'])].reset_index(drop=True)
+
+results = prepare_forest_df(results, df, advanced_cat=results['category'].tolist()[1:])
+results.to_csv(os.path.join(root_dir, 'report', 'tables', 'forest_pre_treatment_across.csv'), index=False)
+
+plot_params = {
+    'Lesion_volume': {
+        'xlim': (0.5, 1),
+        'figsize': (16, 7.5),
+        'panel_width_ratios': [2.7, 0.8, 0.5],
+        'text_col_widths': [0.25, 0.06, 0.06, 0.12, 0.16, 0.46],
+    },
+    'Radiomics': {
+        'xlim': (0.5, 1),
+        'figsize': (16, 5),
+        'panel_width_ratios': [2.1, 0.4, 0.4],
+        'text_col_widths': [0.17, 0.06, 0.06, 0.1, 0.18, 0.35],
+    },
+    'Brain_health': {
+        'xlim': (0.5, 1),
+        'figsize': (16, 5.5),
+        'panel_width_ratios': [2.3, 0.5, 0.4],
+        'text_col_widths': [0.17, 0.06, 0.06, 0.1, 0.15, 0.3],
+    },
+    'Neural_network': {
+        'xlim': (0.5, 1),
+        'figsize': (16, 4.5),
+        'panel_width_ratios': [2.5, 0.4, 0.4],
+        'text_col_widths': [0.18, 0.06, 0.06, 0.11, 0.22, 0.36],
+    },
+}
+for cat in ['Lesion_volume', 'Radiomics', 'Brain_health', 'Neural_network']:
+    results_subset = pd.concat([results.iloc[:1, :],
+                                results[results['Study'] == (cat.replace('_', ' '))],
+                                results[(results['name'] == cat)]], axis=0).reset_index(drop=True)
+    fig, axes = forest_plot_from_df(
+        results_subset,
+        effect_col="estimate",
+        ci_low_col="ci_0.025",
+        ci_high_col="ci_0.975",
+        label_col="Study",
+        row_type_col="row_type",
+        extra_cols=['Val.', 'Post', 'Severity', 'Imaging feat.', 'Other features'],
+        show_vertical_lines=True,
+        fontsize=9,
+        header_fontsize=10,
+        header_top_pad=0.9,
+        show_study_separators=True,
+        text_pad=0.02,
+        row_height=0.85,  # controls vertical spacing
+        group_gap=0.9,  # extra gap after each subgroup pooled row
+        bold_group_summary=False,
+        color_by_col='row_type_',
+        color_map={
+            'baseline': 'crimson',
+            'group_summary': 'cornflowerblue',
+            'study': 'mediumseagreen',
+        },
+        vertical_line_color={
+            0: 'crimson'
+        },
+        **plot_params.get(cat, {})
+    )
+    plt.savefig(os.path.join(fig_dir, f'forest_{cat}_pre_treatment.png'), dpi=300)
+    plt.show()
+
+
+stitch_figures_vertically([os.path.join(fig_dir, f'forest_{cat}_pre_treatment.png') for cat in ['Lesion_volume', 'Radiomics', 'Brain_health', 'Neural_network']],
+                          output_path=os.path.join(fig_dir, f'forest_pre_treatment_across_study.png'),
+                          panels_output_dir=fig_dir,
+                          panel_prefix='forest_pre_treatment_across_study_panel_',
+                          label_size=100)
+
+
+# %%
+results = run_multimodal_meta_regression(df[(df['post_treatment_models'] == 1)],
+                                         advanced_imaging_categories=advanced_imaging_categories,
+                                         covariates=['external_validation'],
+                                         post_treatment_imaging_only=True,
+                                         mri=None)
+
+print(
+    f"Covariate:\n{results[results['name'].isin(['external_validation', 'post_treatment_models'])][['stroke_type', 'name', 'category', 'delta', 'p-value']].round(3)}")
+results = results[~results['name'].isin(['post_treatment_models', 'external_validation'])].reset_index(drop=True)
+
+results = prepare_forest_df(results, df, advanced_cat=results['category'].tolist()[1:])
+
+results.to_csv(os.path.join(root_dir, 'report', 'tables', 'forest_post_treatment_across.csv'), index=False)
+
+plot_params = {
+    'Lesion_volume': {
+        'xlim': (0.5, 1),
+        'figsize': (16, 6),
+        'panel_width_ratios': [2.7, 0.8, 0.5],
+        'text_col_widths': [0.25, 0.06, 0.06, 0.12, 0.16, 0.46],
+    },
+    'Radiomics': {
+        'xlim': (0.5, 1),
+        'figsize': (16, 4),
+        'panel_width_ratios': [2.1, 0.4, 0.4],
+        'text_col_widths': [0.17, 0.06, 0.06, 0.1, 0.18, 0.35],
+    },
+    'Brain_health': {
+        'xlim': (0.5, 1),
+        'figsize': (16, 4.0),
+        'panel_width_ratios': [2.3, 0.5, 0.4],
+        'text_col_widths': [0.17, 0.06, 0.06, 0.1, 0.15, 0.3],
+    },
+    'Neural_network': {
+        'xlim': (0.5, 1),
+        'figsize': (16, 4),
+        'panel_width_ratios': [2.5, 0.4, 0.4],
+        'text_col_widths': [0.18, 0.06, 0.06, 0.11, 0.22, 0.36],
+    },
+}
+for cat in ['Lesion_volume', 'Radiomics', 'Brain_health', 'Neural_network']:
+    results_subset = pd.concat([results.iloc[:1, :],
+                                results[results['Study'] == (cat.replace('_', ' '))],
+                                results[(results['name'] == cat)]], axis=0).reset_index(drop=True)
+    fig, axes = forest_plot_from_df(
+        results_subset,
+        effect_col="estimate",
+        ci_low_col="ci_0.025",
+        ci_high_col="ci_0.975",
+        label_col="Study",
+        row_type_col="row_type",
+        extra_cols=['Val.', 'Post', 'Severity', 'Imaging feat.', 'Other features'],
+        show_vertical_lines=True,
+        fontsize=9,
+        header_fontsize=10,
+        header_top_pad=0.9,
+        show_study_separators=True,
+        text_pad=0.02,
+        row_height=0.85,  # controls vertical spacing
+        group_gap=0.9,  # extra gap after each subgroup pooled row
+        bold_group_summary=False,
+        color_by_col='row_type_',
+        color_map={
+            'baseline': 'crimson',
+            'group_summary': 'cornflowerblue',
+            'study': 'mediumseagreen',
+        },
+        vertical_line_color={
+            0: 'crimson'
+        },
+        **plot_params.get(cat, {})
+    )
+    plt.savefig(os.path.join(fig_dir, f'forest_{cat}_post_treatment.png'), dpi=300)
+    plt.show()
+
+stitch_figures_vertically([os.path.join(fig_dir, f'forest_{cat}_post_treatment.png') for cat in ['Lesion_volume', 'Radiomics', 'Brain_health', 'Neural_network']],
+                          output_path=os.path.join(fig_dir, f'forest_post_treatment_across_study.png'),
+                          panels_output_dir=fig_dir,
+                          panel_prefix='forest_post_treatment_across_study_panel_',
+                          label_size=100)
+# %%
 # ------------------------------------- Sensitivity analysis ----------------------------------
-
 # sensitivity analysis limited to studies on 0-2 vs 3-6 mRs at 3 months
-results = run_multimodal_meta_regression(df[(df['three_months_outcome'] == 1) & (df['outcome.worse_class_cutoff'] == 3)],
+results = run_multimodal_meta_regression(df[(df['three_months_outcome'] == 1) &
+                                            (df['outcome.worse_class_cutoff'] == 3) &
+                                            (df['missing_varvalue'] == 0)],
                                          advanced_imaging_categories=advanced_imaging_categories,
                                          stroke_type='ischemic',
                                          covariates=['external_validation', 'post_treatment_models'],)
 print(
     f"Covariate:\n{results[results['name'].isin(['external_validation', 'post_treatment_models'])][['stroke_type', 'name', 'category', 'delta', 'p-value']].round(3)}")
-# drop covariates
 results = results[~results['name'].isin(['post_treatment_models', 'external_validation'])].reset_index(drop=True)
-results = prepare_forest_df(results, df, sensitivity=True)
-results = results.rename(columns={
-    'Validated': 'Val.',
-    'Post-treatment': 'Post',
-    'Imaging feature': 'Imaging feat.',
-})
+
+results = prepare_forest_df(results, df, advanced_cat=results['category'].tolist()[1:])
+
+results.to_csv(os.path.join(root_dir, 'report', 'tables', 'forest_restricted_across.csv'), index=False)
+
+
 plot_params = {
     'Lesion_volume': {
         'xlim': (0.5, 1),
-        'figsize': (16, 18),
+        'figsize': (16, 17),
         'panel_width_ratios': [2.7, 0.8, 0.5],
         'text_col_widths': [0.25, 0.06, 0.06, 0.12, 0.16, 0.46],
     },
@@ -639,13 +961,13 @@ plot_params = {
     },
     'Radiomics': {
         'xlim': (0.5, 1),
-        'figsize': (16, 8),
+        'figsize': (16, 6),
         'panel_width_ratios': [2.1, 0.4, 0.4],
         'text_col_widths': [0.17, 0.06, 0.06, 0.1, 0.18, 0.35],
     },
     'Brain_health': {
         'xlim': (0.5, 1),
-        'figsize': (16, 6),
+        'figsize': (16, 5),
         'panel_width_ratios': [2.3, 0.5, 0.4],
         'text_col_widths': [0.17, 0.06, 0.06, 0.1, 0.15, 0.3],
     },
@@ -688,15 +1010,16 @@ for cat in ['Lesion_volume', 'Lesion_location', 'Radiomics', 'Brain_health', 'Ne
         },
         **plot_params.get(cat, {})
     )
-    plt.savefig(os.path.join(fig_dir, f'forest_{cat}_subset.png'), dpi=300)
+    plt.savefig(os.path.join(fig_dir, f'forest_{cat}_sensitivity_across_study.png'), dpi=300)
     plt.show()
 
-# stich
-stitch_figures_vertically([os.path.join(fig_dir, f'forest_{cat}_subset.png') for cat in ['Lesion_volume', 'Lesion_location', 'Radiomics', 'Brain_health', 'Neural_network']],
-                          output_path=os.path.join(fig_dir, f'forest_stiched_subset.png'),
+stitch_figures_vertically([os.path.join(fig_dir, f'forest_{cat}_sensitivity_across_study.png') for cat in ['Lesion_volume', 'Lesion_location', 'Radiomics', 'Brain_health', 'Neural_network']],
+                          output_path=os.path.join(fig_dir, f'forest_sensitivity_across_study.png'),
                           panels_output_dir=fig_dir,
-                          panel_prefix='forest_subset_panel_',
+                          panel_prefix='forest_sensitivity_across_study_panel_',
                           label_size=100)
+
+# %%
 # sensitivity analysis separately on severe, moderate, mild ischemic stroke
 results = []
 for severity in ['mild', 'moderate', 'severe']:
@@ -743,6 +1066,8 @@ results.loc[results['Study'] == 'Baseline', ['Delta AUC', 'Heterogeneity']] = ''
 results = results.rename({'Study': 'Category'}, axis=1)
 del add
 
+results.to_csv(os.path.join(root_dir, 'report', 'tables', 'forest_severity_across.csv'), index=False)
+
 fig, axes = forest_plot_from_df(
     results,
     effect_col="estimate",
@@ -775,105 +1100,19 @@ fig, axes = forest_plot_from_df(
 plt.savefig(os.path.join(fig_dir, f'forest_severity.png'), dpi=300)
 plt.show()
 
+# %%
 
-# ------------------------------ Within study analyses (nested models) ------------------------------
-results, add = run_nested_meta_regression(df, advanced_imaging_categories=advanced_imaging_categories)
-add = add.explode(['Key', 'studies', 'auc_delta', 'var_delta']).reset_index(drop=True)
 
-add_single = []
-for cat in add['category'].unique():
-    add_single.append({
-        'Study': cat.replace('_', ' '),
-        'row_type': 'group_header',
-    })
-    subset = add[add['category'] == cat].sort_values(by='auc_delta', ascending=True)
-    for _, row in subset.iterrows():
-        auc_delta = row['auc_delta']
-        var_delta = row['var_delta']
-        se_delta = np.sqrt(var_delta)
-        ci_lower = auc_delta - 1.96 * se_delta
-        ci_higher = auc_delta + 1.96 * se_delta
-        row['predictors.category'] = df.loc[-df['nested'] & (df['Key'] == row['Key']), 'predictors.category'].values[0]
-        row['predictors.scale'] = df.loc[-df['nested'] & (df['Key'] == row['Key']), 'predictors.scale'].values[0]
-        row_cat = np.array(row['predictors.category'].split(', '))
-        row_pred = np.array(row['predictors.scale'].split(', '))
-        adv_pred = ', '.join(np.unique(row_pred[row_cat == cat.replace('_', ' ').lower()]).tolist())
-        adv_pred = adv_pred.replace('white matter hyperintensities', 'WMH')
-
-        if row['studies'] == 'Johnston et al (2009)':
-            adv_pred = 'infarct volume'
-        if row['studies'] == 'Oliveira et al (2023)':
-            adv_pred = 'CTA raw image'
-        other_pred = ', '.join(np.unique(row_pred[row_cat != cat.replace('_', ' ').lower()]).tolist())
-        adv_pred = '\n'.join(textwrap.wrap(adv_pred, width=30))
-        other_pred = '\n'.join(textwrap.wrap(other_pred, width=45))
-
-        add_single.append({
-            'Study': row['studies'],
-            'name': cat,
-            'category': cat,
-            'estimate': auc_delta,
-            'ci_0.025': ci_lower,
-            'ci_0.975': ci_higher,
-            'Added imaging': adv_pred,
-            'Nested model': other_pred,
-            'row_type': 'study',
-        })
-    # add group summary
-    pooled = results.loc[results['category'] == cat, :].iloc[0].to_dict()
-    mdl_summary = f'RE model - pooled ΔAUC p={pooled["p-value"]:.3f}'
-    mdl_het = f'I² {pooled["I2"]:.1f}%, τ² {pooled["tau2"]:.3f} p={pooled["p_het"]:.3f}'
-    add_single.append({
-        'Study': mdl_summary,
-        'row_type': 'group_summary',
-        **pooled
-    })
-    pooled['estimate'] = np.nan
-    pooled['ci_0.025'] = np.nan
-    pooled['ci_975'] = np.nan
-    add_single.append({
-        'Study': mdl_het,
-        'row_type': 'group_summary',
-        **pooled
-    })
-results = pd.DataFrame(add_single)
-del add_single, pooled, subset, row, se_delta, var_delta, auc_delta, ci_higher, ci_lower
-
-# plot forest plot
-fig, axes = forest_plot_from_df(
-    results,
-    effect_col="estimate",
-    ci_low_col="ci_0.025",
-    ci_high_col="ci_0.975",
-    label_col="Study",
-    row_type_col="row_type",
-    extra_cols=['Nested model','Added imaging'],
-    panel_width_ratios=[3, 1.0, 0.6],
-    text_col_widths=[0.22, 0.35, 0.25],
-    show_vertical_lines=True,
-    show_study_separators=True,
-    fontsize=12,
-    header_fontsize=13,
-    header_top_pad=1,
-    text_pad=0.02,
-    figsize=(16, 15),
-    row_height=0.85,  # controls vertical spacing
-    group_gap=0.9,  # extra gap after each subgroup pooled row
-    bold_group_summary=False,
-    xlim=None,
-    xticks=[-0.05, 0, 0.05, 0.1],
-    vertical_line_color={
-        0: 'crimson'
-    },
-    color_by_col='row_type',
-    color_map={
-        'group_summary': 'cornflowerblue',
-        'study': 'mediumseagreen',
-    },
+fig = plot_control_analyses(
+    input_dir=os.path.join(root_dir, 'report', 'tables'),
+    show_external=True,           # Column labelled “Val.”
+    show_studies=False,
+    show_pvalues=True,            # Both panels
+    bold_reference_label=False,  # True for bold
+    show_notes=False,             # Legend outside the figure
 )
-plt.savefig(os.path.join(fig_dir, f'forest_nested.png'), dpi=300)
-plt.show()
 
+save_figure(fig, os.path.join(fig_dir, 'control_analyses_summary.png'), dpi=600)
 
 # %%
 # ------------------------------ Prediction analysis ------------------------------
@@ -890,6 +1129,9 @@ subset = df.loc[(df['sample.stroke_type'] == 'ischemic'), all_predictors_subset 
                                                            'sample.nih_stroke_scale.value', 'n_total', 'nested']]
 print(f'Subset size: {subset.shape[0]} models')
 n_total_avg = subset.loc[-subset['nested'], 'n_total'].median()
+# impute post_treatment_models and severity with the mode of the respective column
+subset['post_treatment_models'] = subset['post_treatment_models'].fillna(subset['post_treatment_models'].mode()[0])
+subset['severity'] = subset['severity'].fillna(subset['severity'].mode()[0])
 logger.warning(f'Average sample size: {n_total_avg}')
 result = learn_surrogate_and_rank(
     X_bin=subset[all_predictors_subset],
@@ -924,7 +1166,7 @@ print(round(result["outer_cv"]['pooled_metrics']['r2'], 2))
 cv = pd.DataFrame(result["outer_cv"]["folds"])
 print(cv[['best_params', 'mae', 'r2']])
 
-
+# %%
 for val in [0, 1]:
     ranked_df = []
     for scen in result["scenarios"]:
@@ -960,80 +1202,10 @@ for val in [0, 1]:
                 figsize=(15, 12),
                 constant_circle_size=700,
                 scale_circle_size=False,
+                scenario_legend=False,
                 feature_name_map={
                     'NIHSS': 'NIHSS admission',
-                    'NIHSS post treatment': 'NIHSS post revascularization',
-                    'mRS': 'discharge mRS',
                     'glucose': 'admission glucose',
                     'hemoglobin': 'admission hemoglobin',
                 })
 
-
-# %%
-# ------------------------------ Geographical analysis ------------------------------
-
-countries_df = df.loc[-df['nested'], ['study_id', 'Key', 'model_id', 'n_total', 'charms.sample_nation']].dropna(
-    subset=['charms.sample_nation'])
-countries_df['charms.sample_nation'] = countries_df['charms.sample_nation'].apply(lambda x: literal_eval(x))
-countries_df = countries_df.explode('charms.sample_nation')
-countries_df = countries_df.rename(columns={
-    'charms.sample_nation': 'country'
-})
-# split evenly n_total if multiple countries
-countries_df['n_total_scaled'] = countries_df.groupby('Key')['n_total'].transform(lambda x: x / len(x))
-# replace some of the following values
-countries_df = countries_df.replace({
-    'USA': 'United States of America',
-    'US': 'United States of America',
-    'United States': 'United States of America',
-    'UK': 'United Kingdom',
-    'Korea': 'Republic of Korea',
-})
-
-# convert the country names to ISO 3166-1 alpha-3
-countries_df['iso'] = countries_df['country'].map(country_to_iso3)
-# drop None
-check = countries_df[countries_df['iso'].isna()]['country']
-countries_df = countries_df[countries_df['iso'].notna()]
-# count occurrences of each country
-country_counts = countries_df.groupby('iso').agg({
-    'Key': 'nunique',
-    'model_id': 'nunique',
-    'n_total_scaled': 'sum'
-}).reset_index()
-# add country names
-country_counts['country'] = country_counts['iso'].map({v: k for k, v in country_to_iso3.items()})
-# print top countries by model_id
-country_counts = country_counts.sort_values(by='n_total_scaled', ascending=False).reset_index(drop=True)
-# %%
-pop = pd.read_excel(os.path.join(data_dir, 'population', 'API_SP.POP.TOTL_DS2_en_excel_v2_23077.xls'), skiprows=3)
-pop = pop[['Country Name', 'Country Code', '2024']].rename(columns={
-    'Country Code': 'iso',
-    '2024': 'population'
-})
-# add taiwan population which is missing
-# merge with country_counts
-country_counts = country_counts.merge(pop, on='iso', how='outer')
-country_counts.loc[country_counts['iso'] == 'TWN', 'population'] = 23083961
-# compute relative density per 10 million people
-country_counts['rel_density'] = country_counts['n_total_scaled'] / country_counts['population'] * 10_000_000
-country_counts = country_counts.sort_values(by='rel_density', ascending=False).reset_index(drop=True)
-# drop rows with NaN rel_density
-country_counts = country_counts[country_counts['rel_density'].notna()]
-print(country_counts)
-# %%
-
-fig = px.choropleth(
-    country_counts,
-    locations="iso",  # column with country names
-    color="rel_density",  # column with your values
-    hover_name="country",
-    color_continuous_scale="Viridis",
-    projection="natural earth",
-    scope='world',
-    basemap_visible=True,
-)
-# change legend title
-fig.update_layout(coloraxis_colorbar=dict(title="Stroke patients per 10M people"))
-fig.write_image(os.path.join(fig_dir, f'country_reldensity.png'), scale=3, width=1000, height=600)
-fig.show()
